@@ -19,6 +19,7 @@ from unittest.mock import Mock, AsyncMock, patch
 
 from veadk.integrations.ve_identity.mcp_toolset import VeIdentityMcpToolset
 from veadk.integrations.ve_identity.auth_config import api_key_auth, oauth2_auth
+from veadk.integrations.ve_identity.mcp_tool import VeIdentityMcpTool
 
 
 class TestVeIdentityMcpToolsetInit:
@@ -80,6 +81,24 @@ class TestVeIdentityMcpToolsetInit:
         )
 
         assert toolset._tool_name_prefix == prefix
+
+    @patch("veadk.integrations.ve_identity.auth_mixins.IdentityClient")
+    def test_init_with_tip_token_propagation(self, mock_identity_client):
+        """Test initializing with user token to MCP TIP propagation enabled."""
+        connection_params = Mock()
+        config = api_key_auth("test-provider")
+
+        toolset = VeIdentityMcpToolset(
+            auth_config=config,
+            connection_params=connection_params,
+            propagate_user_token_as_tip=True,
+            tip_workload_name="mcp-authz-workload",
+            tip_credential_key="custom_inbound_auth",
+        )
+
+        assert toolset._propagate_user_token_as_tip is True
+        assert toolset._tip_workload_name == "mcp-authz-workload"
+        assert toolset._tip_credential_key == "custom_inbound_auth"
 
     def test_init_with_none_connection_params(self):
         """Test that initialization fails with None connection_params."""
@@ -208,3 +227,58 @@ class TestVeIdentityMcpToolsetClose:
 
         # Should not raise, just log the error
         await toolset.close()
+
+
+class TestVeIdentityMcpToolsetGetTools:
+    """Tests for VeIdentityMcpToolset.get_tools method."""
+
+    @pytest.mark.asyncio
+    @patch("veadk.integrations.ve_identity.mcp_toolset.VeIdentityMcpTool")
+    @patch("veadk.integrations.ve_identity.auth_mixins.IdentityClient")
+    async def test_get_tools_passes_tip_token_options_to_wrapped_tools(
+        self,
+        mock_identity_client,
+        mock_tool_cls,
+    ):
+        """Test wrapped MCP tools receive TIP propagation settings."""
+        connection_params = Mock()
+        config = api_key_auth("test-provider")
+        toolset = VeIdentityMcpToolset(
+            auth_config=config,
+            connection_params=connection_params,
+            propagate_user_token_as_tip=True,
+            tip_workload_name="mcp-authz-workload",
+            tip_credential_key="custom_inbound_auth",
+        )
+
+        toolset._get_credential = AsyncMock(return_value=Mock())
+        toolset._mcp_session_manager.create_session = AsyncMock(
+            return_value=Mock(
+                list_tools=AsyncMock(
+                    return_value=Mock(
+                        tools=[
+                            Mock(
+                                name="sequentialthinking",
+                                description="Test",
+                                inputSchema={},
+                            )
+                        ]
+                    )
+                )
+            )
+        )
+        wrapped_tool = Mock(spec=VeIdentityMcpTool)
+        wrapped_tool.name = "sequentialthinking"
+        mock_tool_cls.return_value = wrapped_tool
+
+        tools = await toolset.get_tools(readonly_context=Mock())
+
+        assert tools == [wrapped_tool]
+        mock_tool_cls.assert_called_once_with(
+            mcp_tool=mock_tool_cls.call_args.kwargs["mcp_tool"],
+            mcp_session_manager=toolset._mcp_session_manager,
+            auth_config=config,
+            propagate_user_token_as_tip=True,
+            tip_workload_name="mcp-authz-workload",
+            tip_credential_key="custom_inbound_auth",
+        )

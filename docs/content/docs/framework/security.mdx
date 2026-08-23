@@ -84,6 +84,26 @@ toolset = VeIdentityMcpToolset(
 )
 ```
 
+如果 MCP Gateway 还需要基于当前登录用户做资源鉴权，可以开启 TIP 传播：
+
+```python
+from google.adk.tools.mcp_tool.mcp_session_manager import (
+    StreamableHTTPConnectionParams,
+)
+from veadk.integrations.ve_identity import VeIdentityMcpToolset, api_key_auth
+
+toolset = VeIdentityMcpToolset(
+    auth_config=api_key_auth(provider_name="my-mcp-service-api-key"),
+    connection_params=StreamableHTTPConnectionParams(
+        url="https://your-gateway.example.com/mcp",
+    ),
+    propagate_user_token_as_tip=True,
+    tip_workload_name="your-workload-identity-name",
+)
+```
+
+开启后，`VeIdentityMcpToolset` 会在真实 `tools/call` 时从运行时 credential service 的 `inbound_auth` 读取用户池 access token / JWT，调用 Agent Identity 的 `get_workload_access_token_for_jwt` 交换 workload access token，并通过 `X-Ve-TIP-Token` 发送给 MCP Gateway。工具发现阶段的 `initialize` / `tools/list` 不携带 TIP token，只使用 `auth_config` 生成的服务级认证头。
+
 ### 常见问题
 
 **Q：如何更新或轮换凭据？**

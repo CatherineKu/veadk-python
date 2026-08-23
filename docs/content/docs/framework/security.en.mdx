@@ -84,6 +84,33 @@ toolset = VeIdentityMcpToolset(
 )
 ```
 
+If the MCP Gateway also enforces resource authorization for the currently
+signed-in user, enable TIP propagation:
+
+```python
+from google.adk.tools.mcp_tool.mcp_session_manager import (
+    StreamableHTTPConnectionParams,
+)
+from veadk.integrations.ve_identity import VeIdentityMcpToolset, api_key_auth
+
+toolset = VeIdentityMcpToolset(
+    auth_config=api_key_auth(provider_name="my-mcp-service-api-key"),
+    connection_params=StreamableHTTPConnectionParams(
+        url="https://your-gateway.example.com/mcp",
+    ),
+    propagate_user_token_as_tip=True,
+    tip_workload_name="your-workload-identity-name",
+)
+```
+
+When enabled, `VeIdentityMcpToolset` reads the user-pool access token / JWT from
+the runtime credential service key `inbound_auth`, exchanges it through Agent
+Identity's `get_workload_access_token_for_jwt` API for a workload access token,
+and sends that token to the MCP Gateway as `X-Ve-TIP-Token` on real `tools/call`
+requests. Tool discovery requests such as `initialize` and `tools/list` do not
+carry the TIP token; they only use the service-level auth header from
+`auth_config`.
+
 ### FAQ
 
 **Q: How do I rotate or update a credential?**

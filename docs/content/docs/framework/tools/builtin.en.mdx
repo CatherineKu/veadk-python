@@ -529,6 +529,18 @@ Environment variables:
 - `AGENTKIT_TOOL_HOST`: endpoint for calling AgentKit Tools
 - `AGENTKIT_TOOL_SERVICE_CODE`: ServiceCode for calling AgentKit Tools
 - `AGENTKIT_TOOL_REGION`: region for calling AgentKit Tools; defaults to `cn-beijing`
+- `VE_IDENTITY_WORKLOAD_NAME`: optional. When set, `execute_skills` exchanges the
+  runtime `inbound_auth` user access token for a workload access token and forwards
+  it to the Skills Sandbox as `X-Tip-Token-Key`, so MCP calls inside the sandbox can
+  use it for user resource authorization.
+- `VE_SKILL_SANDBOX_TIP_ENABLED`: optional. Set to `true` to try enabling
+  `execute_skills` TIP propagation even when `VE_IDENTITY_WORKLOAD_NAME` is not set.
+
+`execute_skills` only reads `inbound_auth` inside the Agent runtime to exchange a
+TIP token. It no longer forwards the raw user access token to the Skills Sandbox as
+an `inbound_auth` header. The `X-Tip-Token-Key` value is the exchanged workload
+access token. TIP propagation for direct MCP Toolset calls is outside this sandbox
+tool path and should be configured through MCP Toolset support separately.
 
 Additional `config.yaml` keys:
 

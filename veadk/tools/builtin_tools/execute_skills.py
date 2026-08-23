@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import threading
 import time
 import uuid
@@ -52,6 +53,10 @@ _A2A_TERMINAL_STATES = frozenset(
 )
 logger = get_logger(__name__)
 _INBOUND_AUTH_CREDENTIAL_KEY = "inbound_auth"
+_TIP_TOKEN_KEY_HEADER = "X-Tip-Token-Key"
+_TIP_TOKEN_CACHE_STATE_KEY_PREFIX = "skill_sandbox_tip_token"
+_TIP_TOKEN_REFRESH_BUFFER_SECONDS = 60
+_SKILL_SANDBOX_TIP_ENABLED_ENV = "VE_SKILL_SANDBOX_TIP_ENABLED"
 
 
 def _validate_timeout(timeout: int) -> None:
@@ -146,6 +151,117 @@ def _credential_token_value(credential: object | None) -> str | None:
     return None
 
 
+def _get_default_identity_client():
+    from veadk.integrations.ve_identity.auth_config import get_default_identity_client
+
+    return get_default_identity_client()
+
+
+def _workload_name(tool_context: ToolContext) -> str | None:
+    configured = os.getenv("VE_IDENTITY_WORKLOAD_NAME", "").strip()
+    if configured:
+        return configured
+    invocation_context = getattr(tool_context, "_invocation_context", None)
+    agent = getattr(invocation_context, "agent", None)
+    agent_name = getattr(agent, "name", None)
+    return str(agent_name) if agent_name else None
+
+
+def _skill_sandbox_tip_enabled() -> bool:
+    configured = os.getenv(_SKILL_SANDBOX_TIP_ENABLED_ENV, "").strip().lower()
+    if configured in {"1", "true", "yes", "on"}:
+        return True
+    if configured in {"0", "false", "no", "off"}:
+        return False
+    return bool(os.getenv("VE_IDENTITY_WORKLOAD_NAME", "").strip())
+
+
+def _tip_token_cache_key(*, workload_name: str | None, user_token: str) -> str:
+    token_hash = hashlib.sha256(user_token.encode("utf-8")).hexdigest()
+    return f"{_TIP_TOKEN_CACHE_STATE_KEY_PREFIX}:{workload_name or ''}:{token_hash}"
+
+
+def _cached_tip_token(state: object, cache_key: str) -> str | None:
+    if not isinstance(state, dict):
+        return None
+    cached = state.get(cache_key)
+    if not isinstance(cached, dict):
+        return None
+    token = cached.get("token")
+    expires_at = cached.get("expires_at")
+    if not token or not isinstance(expires_at, int):
+        return None
+    if int(time.time()) >= expires_at - _TIP_TOKEN_REFRESH_BUFFER_SECONDS:
+        state.pop(cache_key, None)
+        return None
+    return str(token)
+
+
+def _store_tip_token(
+    state: object,
+    cache_key: str,
+    *,
+    token: str,
+    expires_at: int,
+) -> None:
+    if isinstance(state, dict):
+        state[cache_key] = {"token": token, "expires_at": expires_at}
+
+
+def _tip_token_cache_state(tool_context: ToolContext) -> object:
+    state = getattr(tool_context, "state", None)
+    if isinstance(state, dict):
+        return state
+    invocation_context = getattr(tool_context, "_invocation_context", None)
+    session = getattr(invocation_context, "session", None)
+    return getattr(session, "state", None)
+
+
+def _skill_sandbox_tip_token(
+    tool_context: ToolContext,
+    *,
+    inbound_auth: str | None,
+) -> str | None:
+    if not inbound_auth or not _skill_sandbox_tip_enabled():
+        return None
+
+    workload_name = _workload_name(tool_context)
+    invocation_context = getattr(tool_context, "_invocation_context", None)
+    state = _tip_token_cache_state(tool_context)
+    cache_key = _tip_token_cache_key(
+        workload_name=workload_name,
+        user_token=inbound_auth,
+    )
+    if cached_token := _cached_tip_token(state, cache_key):
+        return cached_token
+
+    try:
+        workload_token = _get_default_identity_client().get_workload_access_token(
+            workload_name=workload_name,
+            user_token=inbound_auth,
+            user_id=getattr(invocation_context, "user_id", None),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to exchange inbound_auth for Skill Sandbox TIP token: %s", exc
+        )
+        return None
+
+    tip_token = getattr(workload_token, "workload_access_token", None)
+    expires_at = getattr(workload_token, "expires_at", None)
+    if not tip_token:
+        logger.warning("Identity service returned an empty Skill Sandbox TIP token")
+        return None
+    if isinstance(expires_at, int):
+        _store_tip_token(
+            state,
+            cache_key,
+            token=str(tip_token),
+            expires_at=expires_at,
+        )
+    return str(tip_token)
+
+
 def _inbound_auth_token_from_credential_service(
     tool_context: ToolContext,
 ) -> str | None:
@@ -164,7 +280,7 @@ def _inbound_auth_token_from_credential_service(
         )
         inbound_auth_token = _credential_token_value(credential)
     logger.debug(
-        "execute_skills inbound_auth received before sandbox send: %s",
+        "execute_skills inbound_auth received before TIP exchange: %s",
         json.dumps(
             _inbound_auth_debug_summary(inbound_auth_token),
             ensure_ascii=False,
@@ -327,7 +443,7 @@ def _post_a2a_jsonrpc(
     payload: dict[str, object],
     timeout: int,
     retry_until: float | None = None,
-    inbound_auth: str | None = None,
+    tip_token_key: str | None = None,
 ) -> dict:
     url = _a2a_jsonrpc_url(endpoint)
     while True:
@@ -341,7 +457,7 @@ def _post_a2a_jsonrpc(
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                **({"inbound_auth": inbound_auth} if inbound_auth else {}),
+                **({_TIP_TOKEN_KEY_HEADER: tip_token_key} if tip_token_key else {}),
             },
             method="POST",
         )
@@ -399,14 +515,27 @@ def _execute_skills_via_a2a(
         "session_id": invocation_context.session.id,
     }
     inbound_auth = _inbound_auth_token(tool_context)
+    tip_token_key = _skill_sandbox_tip_token(
+        tool_context,
+        inbound_auth=inbound_auth,
+    )
     logger.debug(
-        "execute_skills inbound_auth header before sandbox request: %s",
+        "execute_skills inbound_auth before sandbox request: %s",
         json.dumps(
             _inbound_auth_debug_summary(inbound_auth),
             ensure_ascii=False,
             sort_keys=True,
         ),
     )
+    if tip_token_key:
+        logger.debug(
+            "execute_skills X-Tip-Token-Key header before sandbox request: %s",
+            json.dumps(
+                _inbound_auth_debug_summary(tip_token_key),
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
     task = _a2a_result_task(
         "A2ASendMessage",
         _post_a2a_jsonrpc(
@@ -426,7 +555,7 @@ def _execute_skills_via_a2a(
             },
             timeout=_a2a_request_timeout(deadline),
             retry_until=deadline,
-            inbound_auth=inbound_auth,
+            tip_token_key=tip_token_key,
         ),
     )
     task_id = _a2a_task_id(task)
@@ -452,7 +581,7 @@ def _execute_skills_via_a2a(
                 },
                 timeout=_a2a_request_timeout(deadline),
                 retry_until=deadline,
-                inbound_auth=inbound_auth,
+                tip_token_key=tip_token_key,
             ),
         )
         poll_interval = min(poll_interval * 2, _A2A_MAX_POLL_INTERVAL)

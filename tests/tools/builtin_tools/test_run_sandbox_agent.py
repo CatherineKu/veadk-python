@@ -323,7 +323,7 @@ class TestExecuteSkillsSkillApi(unittest.TestCase):
         self.assertEqual("user", payload["params"]["metadata"]["user_id"])
         self.assertEqual("session-1", payload["params"]["metadata"]["session_id"])
 
-    def test_a2a_forwards_inbound_auth_from_credential_service(self):
+    def test_a2a_loads_inbound_auth_without_forwarding_user_token_header(self):
         captured_requests = []
 
         class FakeResponse:
@@ -377,8 +377,183 @@ class TestExecuteSkillsSkillApi(unittest.TestCase):
         self.assertEqual("bearer", credential_service.auth_config.header_scheme)
         request_obj, _timeout = captured_requests[0]
         headers = _headers_lower(request_obj)
-        self.assertEqual({"content-type", "inbound_auth"}, set(headers))
-        self.assertEqual("inbound-user-jwt", headers["inbound_auth"])
+        self.assertEqual({"content-type"}, set(headers))
+
+    def test_a2a_exchanges_inbound_auth_and_forwards_tip_token_key(self):
+        captured_requests = []
+
+        class FakeResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps(self._body).encode()
+
+        responses = [
+            {
+                "jsonrpc": "2.0",
+                "id": "req",
+                "result": {
+                    "kind": "task",
+                    "id": "task-1",
+                    "status": {"state": "working"},
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": "req",
+                "result": {
+                    "kind": "task",
+                    "id": "task-1",
+                    "status": {"state": "completed"},
+                    "artifacts": [{"parts": [{"kind": "text", "text": "a2a result"}]}],
+                },
+            },
+        ]
+
+        def fake_urlopen(request, timeout=None):
+            captured_requests.append((request, timeout))
+            return FakeResponse(responses.pop(0))
+
+        module = _load_execute_skills_module(
+            ensure_agentkit_session_endpoint=lambda **_kwargs: "https://sandbox.test",
+        )
+        calls = []
+
+        class FakeIdentityClient:
+            def get_workload_access_token(self, **kwargs):
+                calls.append(kwargs)
+                return types.SimpleNamespace(
+                    workload_access_token="workload-tip-token",
+                    expires_at=4102444800,
+                )
+
+        module._get_default_identity_client = lambda: FakeIdentityClient()
+        inbound_credential = types.SimpleNamespace(
+            auth_type="HTTP",
+            http=types.SimpleNamespace(
+                credentials=types.SimpleNamespace(token="inbound-user-jwt")
+            ),
+            api_key=None,
+        )
+        tool_context = self._tool_context(
+            credentials_by_key={"inbound_auth": inbound_credential}
+        )
+
+        with (
+            patch.dict(
+                module.os.environ,
+                {
+                    "VE_IDENTITY_WORKLOAD_NAME": "agent",
+                    "VE_SKILL_SANDBOX_TIP_ENABLED": "true",
+                },
+            ),
+            patch.object(module.request, "urlopen", fake_urlopen),
+        ):
+            result = module.execute_skills("do work", tool_context=tool_context)
+
+        self.assertEqual("a2a result", result)
+        self.assertEqual(
+            [
+                {
+                    "workload_name": "agent",
+                    "user_token": "inbound-user-jwt",
+                    "user_id": "user",
+                }
+            ],
+            calls,
+        )
+        self.assertEqual(2, len(captured_requests))
+        for request_obj, _timeout in captured_requests:
+            headers = _headers_lower(request_obj)
+            self.assertNotIn("inbound_auth", headers)
+            self.assertEqual("workload-tip-token", headers["x-tip-token-key"])
+
+    def test_a2a_reuses_cached_tip_token_for_same_user_token(self):
+        captured_requests = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "req",
+                        "result": {
+                            "kind": "task",
+                            "id": "task-1",
+                            "status": {"state": "completed"},
+                            "artifacts": [
+                                {"parts": [{"kind": "text", "text": "a2a result"}]}
+                            ],
+                        },
+                    }
+                ).encode()
+
+        def fake_urlopen(request, timeout=None):
+            captured_requests.append((request, timeout))
+            return FakeResponse()
+
+        module = _load_execute_skills_module(
+            ensure_agentkit_session_endpoint=lambda **_kwargs: "https://sandbox.test",
+        )
+        calls = []
+
+        class FakeIdentityClient:
+            def get_workload_access_token(self, **kwargs):
+                calls.append(kwargs)
+                return types.SimpleNamespace(
+                    workload_access_token="workload-tip-token",
+                    expires_at=4102444800,
+                )
+
+        module._get_default_identity_client = lambda: FakeIdentityClient()
+        inbound_credential = types.SimpleNamespace(
+            auth_type="HTTP",
+            http=types.SimpleNamespace(
+                credentials=types.SimpleNamespace(token="inbound-user-jwt")
+            ),
+            api_key=None,
+        )
+        tool_context = self._tool_context(
+            credentials_by_key={"inbound_auth": inbound_credential}
+        )
+
+        with (
+            patch.dict(
+                module.os.environ,
+                {
+                    "VE_IDENTITY_WORKLOAD_NAME": "agent",
+                    "VE_SKILL_SANDBOX_TIP_ENABLED": "true",
+                },
+            ),
+            patch.object(module.request, "urlopen", fake_urlopen),
+        ):
+            self.assertEqual(
+                "a2a result",
+                module.execute_skills("do work", tool_context=tool_context),
+            )
+            self.assertEqual(
+                "a2a result",
+                module.execute_skills("do more work", tool_context=tool_context),
+            )
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(captured_requests))
+        for request_obj, _timeout in captured_requests:
+            headers = _headers_lower(request_obj)
+            self.assertEqual("workload-tip-token", headers["x-tip-token-key"])
 
     def test_logs_inbound_auth_summaries_without_secret_value(self):
         captured_logs = []
@@ -435,8 +610,8 @@ class TestExecuteSkillsSkillApi(unittest.TestCase):
         self.assertNotIn(token, logs)
         self.assertEqual(2, len(captured_logs))
 
-        received_prefix = "execute_skills inbound_auth received before sandbox send: "
-        send_prefix = "execute_skills inbound_auth header before sandbox request: "
+        received_prefix = "execute_skills inbound_auth received before TIP exchange: "
+        send_prefix = "execute_skills inbound_auth before sandbox request: "
         self.assertTrue(captured_logs[0].startswith(received_prefix))
         self.assertTrue(captured_logs[1].startswith(send_prefix))
 
@@ -597,18 +772,8 @@ class TestExecuteSkillsSkillApi(unittest.TestCase):
         get_request, _get_timeout = captured_requests[1]
         send_payload = json.loads(send_request.data.decode())
         get_payload = json.loads(get_request.data.decode())
-        self.assertEqual(
-            "inbound-user-jwt", _headers_lower(send_request)["inbound_auth"]
-        )
-        self.assertEqual(
-            "inbound-user-jwt", _headers_lower(get_request)["inbound_auth"]
-        )
-        self.assertEqual(
-            {"content-type", "inbound_auth"}, set(_headers_lower(send_request))
-        )
-        self.assertEqual(
-            {"content-type", "inbound_auth"}, set(_headers_lower(get_request))
-        )
+        self.assertEqual({"content-type"}, set(_headers_lower(send_request)))
+        self.assertEqual({"content-type"}, set(_headers_lower(get_request)))
         self.assertEqual("message/send", send_payload["method"])
         self.assertEqual("tasks/get", get_payload["method"])
         self.assertEqual("task-1", get_payload["params"]["id"])

@@ -525,6 +525,16 @@ if __name__ == "__main__":
 - `AGENTKIT_TOOL_HOST`：调用 AgentKit Tools 的 Endpoint
 - `AGENTKIT_TOOL_SERVICE_CODE`：调用 AgentKit Tools 的 ServiceCode
 - `AGENTKIT_TOOL_REGION`：调用 AgentKit Tools 的地域，默认 `cn-beijing`
+- `VE_IDENTITY_WORKLOAD_NAME`：可选。配置后，`execute_skills` 会把运行时
+  `inbound_auth` 中的用户 access token 交换为 workload access token，并通过
+  `X-Tip-Token-Key` 透传给 Skills Sandbox，供沙箱内部 MCP 调用做用户资源鉴权。
+- `VE_SKILL_SANDBOX_TIP_ENABLED`：可选。设为 `true` 时即使未配置
+  `VE_IDENTITY_WORKLOAD_NAME`，也会尝试为 `execute_skills` 启用 TIP 透传。
+
+`execute_skills` 只在 Agent runtime 内部读取 `inbound_auth` 用于换取 TIP token，
+不会再把原始用户 access token 作为 `inbound_auth` header 发给 Skills Sandbox。
+`X-Tip-Token-Key` 中传递的是交换后的 workload access token。普通 Agent 直接调用
+MCP Toolset 的 TIP 透传不属于该工具链路，需按 MCP Toolset 的能力单独配置。
 
 新增的 `config.yaml` 配置项：
 
